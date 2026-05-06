@@ -52,6 +52,8 @@ def migrate_legacy_database(target_path: Path) -> bool:
         # Common user directories
         Path.home() / "Documents" / "data" / "tracker.db",
         Path.home() / "Desktop" / "data" / "tracker.db",
+        # Older Linux fallback used before XDG data directories were supported
+        Path.home() / ".titrack" / "tracker.db",
     ]
 
     # Also check the non-portable location (in case of mode confusion)

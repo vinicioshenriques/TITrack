@@ -24,11 +24,14 @@ body.opaque .overlay-container {
     background: #1a1a2e;
 }
 
-/* Transparent mode - uses chroma key with MSHTML backend */
-/* MSHTML uses GDI-based rendering which works with WinForms TransparencyKey.
-   Only the body should be chroma-key color. UI elements use transparent backgrounds
-   so they show content while letting the chroma key show through empty areas. */
+/* Transparent mode */
+/* Some backends support true transparency, others rely on chroma key. */
 body.transparent {
+    background: transparent;
+}
+
+/* Chroma key mode (Windows legacy) */
+body.transparent.chroma {
     background: #ff00ff !important;  /* Magenta chroma key - must match commands.py */
 }
 

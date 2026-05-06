@@ -271,12 +271,17 @@ function stopAutoRefresh() {
 // --- Initialization ---
 
 document.addEventListener('DOMContentLoaded', async () => {
-    // Check for ?transparent=1 query parameter (used by MSHTML backend)
+    // Check for query parameters that influence transparency
     const urlParams = new URLSearchParams(window.location.search);
     const forceTransparent = urlParams.get('transparent') === '1';
+    const chromaMode = urlParams.get('chroma') === '1';
+
+    if (chromaMode) {
+        document.body.classList.add('chroma');
+    }
 
     if (forceTransparent) {
-        // MSHTML mode: apply transparent CSS immediately, chroma key applied by Python
+        // Forced mode: apply transparent CSS immediately
         isTransparent = true;
         document.body.classList.remove('opaque');
         document.body.classList.add('transparent');

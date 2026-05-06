@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -101,13 +102,16 @@ class GitHubClient:
         # Extract version from tag (remove leading 'v' if present)
         version = tag_name.lstrip("v")
 
-        # Find Windows ZIP asset
+        platform_tokens = _release_asset_tokens()
+
+        # Find a platform-appropriate ZIP asset
         download_url = None
         download_size = None
         assets = data.get("assets", [])
         for asset in assets:
             name = asset.get("name", "")
-            if "windows" in name.lower() and name.endswith(".zip"):
+            lower_name = name.lower()
+            if any(token in lower_name for token in platform_tokens) and lower_name.endswith(".zip"):
                 download_url = asset.get("browser_download_url")
                 download_size = asset.get("size")
                 break
@@ -129,6 +133,17 @@ class GitHubClient:
             download_url=download_url,
             download_size=download_size,
         )
+
+
+def _release_asset_tokens() -> tuple[str, ...]:
+    """Return release asset name tokens for the current platform."""
+    if sys.platform == "win32":
+        return ("windows", "win-x64", "win_x64", "win64")
+    if sys.platform.startswith("linux"):
+        return ("linux",)
+    if sys.platform == "darwin":
+        return ("macos", "darwin")
+    return (sys.platform,)
 
 
 def parse_version(version_str: str) -> tuple[int, ...]:

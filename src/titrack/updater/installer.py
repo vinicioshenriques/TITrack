@@ -1,6 +1,7 @@
 """Update installer - download and apply updates."""
 
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -125,12 +126,12 @@ class UpdateInstaller:
 
     def create_update_script(self, update_dir: Path) -> Optional[Path]:
         """
-        Create a batch script to apply the update and restart.
+        Create a platform script to apply the update and restart.
 
         The script:
-        1. Waits for TITrack.exe to exit
+        1. Waits for TITrack to exit
         2. Copies new files over old
-        3. Restarts TITrack.exe
+        3. Restarts TITrack
         4. Cleans up temp files
 
         Args:
@@ -143,6 +144,16 @@ class UpdateInstaller:
             print("Update scripts only work in frozen mode")
             return None
 
+        if sys.platform == "win32":
+            return self._create_windows_update_script(update_dir)
+        if sys.platform.startswith("linux"):
+            return self._create_linux_update_script(update_dir)
+
+        print(f"Updates are not supported on this platform: {sys.platform}")
+        return None
+
+    def _create_windows_update_script(self, update_dir: Path) -> Optional[Path]:
+        """Create a Windows batch update script."""
         app_dir = get_app_dir()
         exe_path = app_dir / "TITrack.exe"
         script_path = update_dir.parent / "update.bat"
@@ -207,6 +218,58 @@ exit /b 0
             print(f"Failed to create update script: {e}")
             return None
 
+    def _create_linux_update_script(self, update_dir: Path) -> Optional[Path]:
+        """Create a Linux shell update script."""
+        app_dir = get_app_dir()
+        exe_path = Path(sys.executable)
+        script_path = update_dir.parent / "update.sh"
+        pid = os.getpid()
+        app_dir_q = shlex.quote(str(app_dir))
+        update_dir_q = shlex.quote(str(update_dir))
+        exe_path_q = shlex.quote(str(exe_path))
+        temp_dir_q = shlex.quote(str(update_dir.parent))
+
+        script_content = f'''#!/usr/bin/env bash
+set -euo pipefail
+
+APP_PID="{pid}"
+APP_DIR={app_dir_q}
+UPDATE_DIR={update_dir_q}
+EXE_PATH={exe_path_q}
+TEMP_DIR={temp_dir_q}
+
+echo "Waiting for TITrack to close..."
+while kill -0 "$APP_PID" 2>/dev/null; do
+    sleep 1
+done
+
+echo "Applying update..."
+cp -a "$UPDATE_DIR"/. "$APP_DIR"/
+
+if [ -f "$EXE_PATH" ]; then
+    chmod +x "$EXE_PATH" || true
+fi
+if [ -f "$APP_DIR/TITrack" ]; then
+    chmod +x "$APP_DIR/TITrack" || true
+    EXE_PATH="$APP_DIR/TITrack"
+fi
+
+echo "Update complete. Starting TITrack..."
+cd "$APP_DIR"
+nohup "$EXE_PATH" >/dev/null 2>&1 &
+
+sleep 2
+rm -rf "$TEMP_DIR"
+'''
+
+        try:
+            script_path.write_text(script_content, encoding="utf-8")
+            script_path.chmod(0o755)
+            return script_path
+        except Exception as e:
+            print(f"Failed to create update script: {e}")
+            return None
+
     def apply_update(self, script_path: Path) -> bool:
         """
         Execute the update script and exit current process.
@@ -226,18 +289,27 @@ exit /b 0
         try:
             import subprocess
 
-            # Kill overlay process before exiting so it doesn't file-lock
-            # TITrackOverlay.exe and prevent the update from overwriting it
-            subprocess.run(
-                ["taskkill", "/IM", "TITrackOverlay.exe"],
-                capture_output=True,
-            )
+            if sys.platform == "win32":
+                # Kill overlay process before exiting so it doesn't file-lock
+                # TITrackOverlay.exe and prevent the update from overwriting it
+                subprocess.run(
+                    ["taskkill", "/IM", "TITrackOverlay.exe"],
+                    capture_output=True,
+                )
 
-            # Start the update script in a new process
-            subprocess.Popen(
-                ["cmd", "/c", str(script_path)],
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
+                # Start the update script in a new process
+                subprocess.Popen(
+                    ["cmd", "/c", str(script_path)],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            elif sys.platform.startswith("linux"):
+                subprocess.Popen(
+                    ["/usr/bin/env", "bash", str(script_path)],
+                    start_new_session=True,
+                )
+            else:
+                print(f"Cannot apply update on this platform: {sys.platform}")
+                return False
 
             # Exit current process to allow update
             # Use os._exit() instead of sys.exit() because sys.exit() raises

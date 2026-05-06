@@ -1,13 +1,13 @@
 # TITrack — Torchlight Infinite Loot Tracker
 
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![GitHub release](https://img.shields.io/github/v/release/astockman99/TITrack)
 
 **Track your loot. Know your profit. Farm smarter.**
 
-TITrack is a free, privacy-focused Windows desktop app that reads Torchlight Infinite game logs to automatically track every item you pick up, calculate profit per map run, and show your net worth in real time. No cheating, no memory hooks, no cloud account required — just pure log parsing.
+TITrack is a free, privacy-focused desktop app for Windows and Linux that reads Torchlight Infinite game logs to automatically track every item you pick up, calculate profit per map run, and show your net worth in real time. No cheating, no memory hooks, no cloud account required — just pure log parsing.
 
 Whether you're min-maxing your farming route or just curious how much you're earning per hour, TITrack gives you the data to make better decisions.
 
@@ -34,6 +34,8 @@ Inspired by [WealthyExile](https://github.com/WealthyExile) for Path of Exile.
 
 ### Recommended: Use the Setup Tool
 
+Windows users should use the setup tool:
+
 1. Go to the [latest release](https://github.com/astockman99/TITrack/releases/latest)
 2. Download **`TITrack-Setup.exe`**
 3. Run it and choose where to extract (e.g. `C:\TITrack`)
@@ -51,6 +53,18 @@ Inspired by [WealthyExile](https://github.com/WealthyExile) for Path of Exile.
 4. Run `TITrack.exe`
 
 </details>
+
+### Linux: Manual ZIP
+
+1. Download `TITrack-x.x.x-linux.zip` from the [latest release](https://github.com/astockman99/TITrack/releases/latest)
+2. Extract it to a folder such as `~/Games/TITrack`
+3. Run `./TITrack`
+
+On Arch/CachyOS, install the native window dependencies if the packaged build does not already include everything your desktop needs:
+
+```bash
+sudo pacman -S --needed gtk3 webkit2gtk
+```
 
 ### First-Time Setup
 
@@ -70,9 +84,9 @@ TITrack includes a compact always-on-top overlay window so you can see your stat
 
 ![Overlay in-game](docs/screenshots/overlay.png)
 
-- **Launch**: Click "Overlay" in the dashboard, or run `TITrack.exe --overlay`
+- **Launch**: Click "Overlay" in the dashboard, or run `TITrack.exe --overlay` on Windows / `./TITrack --overlay` on Linux
 - **Transparent background** with text drop shadows for visibility over any game scene
-- **Click-through** — stats and loot areas pass clicks to the game underneath
+- **Click-through** — stats and loot areas pass clicks to the game underneath on Windows; Linux uses a frameless always-on-top web overlay
 - **Live stats**: Net Worth, FE/Hour, FE/Map, Runs, Avg Time, Total Time
 - **Current run tracking**: Zone name, duration, and top loot drops sorted by value
 - **Previous run preservation**: When a map ends, loot stays visible labeled "Previous Run"
@@ -233,8 +247,9 @@ Useful when starting for the first time or after inventory gets out of sync.
 ### Prerequisites
 
 - Python 3.11+
-- Windows 10/11
-- .NET 8 SDK (for overlay)
+- Windows 10/11 / Linux
+- .NET 8 SDK (Windows WPF overlay only)
+- Arch/CachyOS native window dependencies: `gtk3` and `webkit2gtk`
 - Torchlight Infinite
 
 ### Setup
@@ -242,6 +257,13 @@ Useful when starting for the first time or after inventory gets out of sync.
 ```bash
 git clone https://github.com/astockman99/TITrack.git
 cd TITrack
+
+# If Arch-based Linux, create a .venv to install dependencies into:
+python -m venv ./.venv
+
+# Activate it (if you're using a Terminal like fish, ensure you use the corresponding activate file):
+./.venv/bin/activate
+
 pip install -e ".[dev]"
 python -m titrack init --seed tlidb_items_seed_en.json
 ```
@@ -257,18 +279,24 @@ python -m titrack serve --port 8080    # Custom port
 ### Building
 
 ```bash
-# Build WPF overlay (requires .NET 8 SDK)
+# Windows: build WPF overlay (requires .NET 8 SDK)
 dotnet publish overlay/TITrackOverlay.csproj -c Release -o overlay/publish
 
-# Build main application
+# Build main application on the current OS
 pip install pyinstaller
 pyinstaller ti_tracker.spec --noconfirm
 
-# Copy overlay to dist (PyInstaller may not include large files reliably)
+# Windows only: copy overlay to dist if needed
 cp overlay/publish/TITrackOverlay.exe dist/TITrack/
 ```
 
 Output is in `dist/TITrack/`.
+
+### Starting the app on Arch-based Linux
+```bash
+# TITrack sets this automatically, but you can also pass it explicitly:
+env WEBKIT_DISABLE_COMPOSITING_MODE=1 ./TITrack
+```
 
 ### Tests
 

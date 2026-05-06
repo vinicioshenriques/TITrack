@@ -2,11 +2,13 @@
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
 import threading
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -47,6 +49,12 @@ def _resolve_player_id(player_info: Optional[PlayerInfo], repo: Repository, logg
                 player_id=saved,
             )
     return player_info
+
+
+@dataclass
+class OverlayState:
+    process: Optional[subprocess.Popen] = None
+    window: Optional[object] = None
 
 
 def print_delta(delta: ItemDelta, repo: Repository) -> None:
@@ -414,6 +422,18 @@ def _check_instance_status(host: str, port: int) -> tuple[bool, bool]:
     return (False, False)  # Port in use by something else
 
 
+def _show_startup_error(message: str) -> None:
+    """Show a platform-appropriate startup error."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, message, "TITrack", 0x10)  # MB_ICONERROR
+            return
+        except Exception:
+            pass
+    print(message)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Start the web server with optional background collector."""
     from titrack.config.paths import is_frozen
@@ -432,11 +452,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             error_msg = f"Port {port} is already in use by another application.\nTry running with --port <number> to use a different port."
 
         if is_frozen():
-            try:
-                import ctypes
-                ctypes.windll.user32.MessageBoxW(0, error_msg, "TITrack", 0x10)  # MB_ICONERROR
-            except Exception:
-                print(error_msg)
+            _show_startup_error(error_msg)
         else:
             print(f"Error: {error_msg}")
         return 1
@@ -493,7 +509,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # If no saved setting or saved path invalid, keep auto-detected path (if any)
 
     # Check if we should use native window mode
-    use_window = is_frozen() and not getattr(args, 'no_window', False)
+    force_window = getattr(args, 'window', False)
+    use_window = not getattr(args, 'no_window', False) and (is_frozen() or force_window or _is_linux())
 
     # Check for overlay-only mode
     overlay_only = getattr(args, 'overlay_only', False)
@@ -643,9 +660,12 @@ def _serve_browser_mode(args: argparse.Namespace, settings: Settings, logger, sh
             logger.info(f"Opening browser at {url}")
             webbrowser.open(url)
 
-        # Launch overlay if requested
+        # Launch overlay if requested (Windows-only in browser mode)
         if show_overlay:
-            overlay_process = _launch_overlay_process(url, logger)
+            if sys.platform == "win32":
+                overlay_process = _launch_overlay_process(url, logger)
+            else:
+                logger.info("Overlay is only available in native window mode on this platform")
 
         logger.info(f"Starting server on port {args.port}")
 
@@ -907,29 +927,147 @@ def _launch_overlay_process(url: str, logger) -> Optional[subprocess.Popen]:
         return None
 
 
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _configure_linux_webview_environment(logger) -> None:
+    """Apply Linux WebKitGTK environment defaults before pywebview starts."""
+    if not _is_linux():
+        return
+
+    # WebKitGTK can fail on some Arch/CachyOS GPU stacks with GBM buffer
+    # allocation errors. Disabling compositing is a conservative default for a
+    # small local dashboard/overlay and users can still override it externally.
+    if "WEBKIT_DISABLE_COMPOSITING_MODE" not in os.environ:
+        os.environ["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
+        logger.info("Set WEBKIT_DISABLE_COMPOSITING_MODE=1 for Linux WebKitGTK stability")
+
+
+def _webview_start_kwargs() -> dict:
+    """Return backend kwargs for pywebview.start on the current platform."""
+    if sys.platform == "win32":
+        return {"gui": "edgechromium"}
+    return {}
+
+
+def _overlay_is_running(overlay_state: OverlayState) -> bool:
+    if overlay_state.process is not None:
+        return overlay_state.process.poll() is None
+    return overlay_state.window is not None
+
+
+def _close_overlay(overlay_state: OverlayState, logger) -> bool:
+    if overlay_state.process is not None:
+        process = overlay_state.process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        overlay_state.process = None
+        logger.info("Overlay closed")
+        return True
+
+    if overlay_state.window is not None:
+        try:
+            overlay_state.window.destroy()
+        except Exception as e:
+            logger.error(f"Error closing overlay window: {e}")
+            return False
+        overlay_state.window = None
+        logger.info("Overlay closed")
+        return True
+
+    return False
+
+
+def _launch_overlay_window(
+    url: str,
+    logger,
+    overlay_state: OverlayState,
+    on_close=None,
+    js_api=None,
+) -> bool:
+    try:
+        import webview
+    except Exception as e:
+        logger.error(f"Overlay window requires pywebview: {e}")
+        return False
+
+    if overlay_state.window is not None:
+        logger.info("Overlay window already running")
+        return True
+
+    overlay_url = f"{url}/overlay.html"
+
+    create_kwargs = {
+        "width": 320,
+        "height": 500,
+        "min_size": (180, 200),
+        "resizable": True,
+        "frameless": True,
+        "on_top": True,
+        "background_color": "#1a1a2e" if _is_linux() else CHROMA_KEY_COLOR_HEX,
+    }
+
+    if js_api is not None:
+        create_kwargs["js_api"] = js_api
+
+    if _is_linux():
+        try:
+            import inspect
+            if "transparent" in inspect.signature(webview.create_window).parameters:
+                create_kwargs["transparent"] = True
+            if "easy_drag" in inspect.signature(webview.create_window).parameters:
+                create_kwargs["easy_drag"] = True
+        except Exception:
+            pass
+
+    window = webview.create_window(
+        "TITrack Overlay",
+        overlay_url,
+        **create_kwargs,
+    )
+    overlay_state.window = window
+
+    def on_overlay_closing():
+        overlay_state.window = None
+        if on_close:
+            on_close()
+
+    window.events.closing += on_overlay_closing
+    return True
+
+
 def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, show_overlay: bool = False, overlay_only: bool = False) -> int:
     """Run server with native window using pywebview."""
     from titrack.config.paths import is_frozen
 
+    _configure_linux_webview_environment(logger)
+
     # Test pywebview/pythonnet availability early, before starting any resources
     try:
         import webview
-        # Try to initialize the CLR/pythonnet which pywebview uses on Windows
-        # This triggers the "Failed to resolve Python.Runtime.Loader.Initialize" error
-        # if .NET components are missing, before we start any other resources
-        try:
-            import clr_loader
-            clr_loader.get_coreclr()
-        except Exception:
-            # clr_loader not available or failed - try direct pythonnet
+        if sys.platform == "win32":
+            # Try to initialize the CLR/pythonnet which pywebview uses on Windows.
+            # This triggers .NET loader errors before we start other resources.
             try:
-                import clr
+                import clr_loader
+                clr_loader.get_coreclr()
             except Exception:
-                pass  # If both fail, webview.start() will give a clearer error
+                try:
+                    import clr
+                except Exception:
+                    pass  # If both fail, webview.start() will give a clearer error
     except ImportError as e:
         logger.warning(f"pywebview not available: {e}")
         logger.warning("Falling back to browser mode...")
-        logger.info("Tip: Install .NET Desktop Runtime or Visual C++ Redistributable for native window mode")
+        if sys.platform == "win32":
+            logger.info("Tip: Install .NET Desktop Runtime or Visual C++ Redistributable for native window mode")
+        elif _is_linux():
+            logger.info("Tip: Install GTK/WebKitGTK dependencies for pywebview native window mode")
         args.no_browser = False
         args.browser_mode = True  # Flag for UI to show Exit button
         return _serve_browser_mode(args, settings, logger)
@@ -1115,25 +1253,15 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
         def on_closing():
             logger.info("Window closed, initiating shutdown...")
             save_window_state()
-            # Close overlay subprocess if running
-            if overlay_ref[0] is not None:
-                process = overlay_ref[0]
-                if process.poll() is None:  # Still running
-                    logger.info("Terminating overlay subprocess...")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                overlay_ref[0] = None
+            _close_overlay(overlay_state, logger)
             server.should_exit = True
             cleanup()
 
         # JavaScript API for native dialogs
         class Api:
-            def __init__(self, window_ref, overlay_ref):
+            def __init__(self, window_ref, overlay_state):
                 self._window = window_ref
-                self._overlay = overlay_ref
+                self._overlay_state = overlay_state
 
             def browse_folder(self):
                 """Open a folder browser dialog and return the selected path."""
@@ -1167,51 +1295,50 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                     return None
 
             def launch_overlay(self):
-                """Launch the WPF overlay as a subprocess."""
+                """Launch the overlay (WPF on Windows, pywebview on Linux)."""
                 try:
-                    # Check if overlay process is already running
-                    if self._overlay[0] is not None:
-                        # Check if process is still alive
-                        if self._overlay[0].poll() is None:
-                            logger.info("Overlay already running")
-                            return True
-                        else:
-                            # Process ended, clear the reference
-                            self._overlay[0] = None
-
-                    # Launch the WPF overlay
-                    process = _launch_overlay_process(url, logger)
-                    if process is not None:
-                        self._overlay[0] = process
+                    if _overlay_is_running(self._overlay_state):
+                        logger.info("Overlay already running")
                         return True
-                    return False
+
+                    if sys.platform == "win32":
+                        process = _launch_overlay_process(url, logger)
+                        if process is not None:
+                            self._overlay_state.process = process
+                            return True
+                        return False
+
+                    return _launch_overlay_window(url, logger, self._overlay_state, js_api=self)
                 except Exception as e:
                     logger.error(f"Error launching overlay: {e}")
                     return False
 
             def close_overlay(self):
-                """Close the overlay subprocess."""
+                """Close the overlay window or subprocess."""
                 try:
-                    if self._overlay[0] is not None:
-                        process = self._overlay[0]
-                        if process.poll() is None:  # Still running
-                            process.terminate()
-                            try:
-                                process.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                        self._overlay[0] = None
-                        logger.info("Overlay closed")
-                        return True
-                    return False
+                    return _close_overlay(self._overlay_state, logger)
                 except Exception as e:
                     logger.error(f"Error closing overlay: {e}")
                     return False
 
+            def toggle_overlay_transparency(self, enabled: bool) -> bool:
+                """Toggle overlay transparency when supported by the backend."""
+                try:
+                    if self._overlay_state.window is None:
+                        return False
+                    if sys.platform == "win32":
+                        if enabled:
+                            return _apply_chroma_key(self._overlay_state.window, logger)
+                        return _remove_chroma_key(self._overlay_state.window, logger)
+                    return True
+                except Exception as e:
+                    logger.error(f"Error toggling overlay transparency: {e}")
+                    return False
+
         # Use lists to allow the API to reference windows after creation
         window_ref = [None]
-        overlay_ref = [None]
-        api = Api(window_ref, overlay_ref)
+        overlay_state = OverlayState()
+        api = Api(window_ref, overlay_state)
 
         # Get DPI scale factor — pywebview's get_position() returns raw device
         # coordinates, but move()/create_window() multiply by scale_factor.
@@ -1353,20 +1480,27 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                 window.events.moved += on_window_moved
                 window.events.resized += on_window_resized
 
-            # Launch WPF overlay subprocess if requested
+            # Launch overlay if requested
             if show_overlay:
-                overlay_process = _launch_overlay_process(url, logger)
-                overlay_ref[0] = overlay_process
+                if sys.platform == "win32":
+                    overlay_state.process = _launch_overlay_process(url, logger)
+                else:
+                    _launch_overlay_window(url, logger, overlay_state, js_api=api)
 
-            # If overlay-only mode, wait for overlay to exit instead of starting pywebview
+            # If overlay-only mode, wait for overlay to exit instead of starting pywebview main window
             if overlay_only:
-                if overlay_ref[0] is not None:
+                if overlay_state.window is not None:
+                    logger.info("Running in overlay-only mode. Waiting for overlay to close...")
+                    webview.start(**_webview_start_kwargs())
+                    logger.info("Overlay closed, shutting down...")
+                    on_closing()
+                elif overlay_state.process is not None:
                     logger.info("Running in overlay-only mode. Waiting for overlay to close...")
                     try:
-                        overlay_ref[0].wait()
+                        overlay_state.process.wait()
                     except KeyboardInterrupt:
-                        if overlay_ref[0].poll() is None:
-                            overlay_ref[0].terminate()
+                        if overlay_state.process.poll() is None:
+                            overlay_state.process.terminate()
                     logger.info("Overlay closed, shutting down...")
                     on_closing()
                 else:
@@ -1375,23 +1509,23 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                     return 1
             else:
                 # This blocks until main window is closed
-                # Force EdgeChromium (WebView2) to prevent silent fallback to
+                # Force EdgeChromium (WebView2) on Windows to prevent silent fallback to
                 # MSHTML (IE11) which can't render modern CSS/JS properly.
                 # If WebView2 is unavailable, this raises an exception caught
                 # below, triggering a browser mode fallback instead.
-                webview.start(gui='edgechromium')
+                webview.start(**_webview_start_kwargs())
 
             logger.info("Application shutdown complete")
             return 0
         except Exception as webview_error:
-            # pywebview/EdgeChromium failed - fall back to browser mode
-            # Common causes: WebView2 runtime not installed, MOTW blocking DLLs,
-            # or .NET components missing. Browser mode works identically.
-            logger.warning(f"Native window failed (WebView2/EdgeChromium): {webview_error}")
+            # pywebview failed - fall back to browser mode. Browser mode works
+            # identically, just without the native shell/overlay integration.
+            backend_name = "WebView2/EdgeChromium" if sys.platform == "win32" else "GTK/WebKitGTK"
+            logger.warning(f"Native window failed ({backend_name}): {webview_error}")
             logger.info("Falling back to browser mode...")
 
-            # Show a message box pointing users to the WebView2 download
-            if is_frozen():
+            # Show a message box pointing Windows users to the WebView2 download
+            if is_frozen() and sys.platform == "win32":
                 try:
                     import ctypes
                     msg = (
@@ -1459,6 +1593,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--no-window",
         action="store_true",
         help="Run in browser mode instead of native window",
+    )
+    parser.add_argument(
+        "--window",
+        action="store_true",
+        help="Force native window mode (useful in development)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -1548,6 +1687,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run in browser mode instead of native window (useful for debugging)",
     )
     serve_parser.add_argument(
+        "--window",
+        action="store_true",
+        help="Force native window mode (useful for development)",
+    )
+    serve_parser.add_argument(
         "--overlay",
         action="store_true",
         help="Open mini-overlay window alongside main window",
@@ -1583,6 +1727,7 @@ def main() -> int:
             # Preserve --overlay and --overlay-only flags from command line
             args.overlay = getattr(args, 'overlay', False)
             args.overlay_only = getattr(args, 'overlay_only', False)
+            args.window = getattr(args, 'window', False)
         else:
             parser.print_help()
             return 0

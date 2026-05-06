@@ -3,7 +3,7 @@ TITrack - Torchlight Infinite Loot Tracker
 
 FIRST TIME SETUP
 ----------------
-If you downloaded this as a ZIP file, you may need to "unblock" it before
+Windows: if you downloaded this as a ZIP file, you may need to "unblock" it before
 the application will run properly:
 
 1. Right-click the downloaded ZIP file (before extracting)
@@ -12,16 +12,20 @@ the application will run properly:
 4. Click "OK"
 5. Now extract the ZIP and run TITrack.exe
 
+Linux: extract the Linux ZIP and run ./TITrack from the extracted folder.
+On Arch/CachyOS, install gtk3 and webkit2gtk if native window mode is not
+available on your system.
+
 REQUIREMENTS
 ------------
 TITrack runs in a native window by default. This requires:
 
-- Windows 10 or 11
-- WebView2 Runtime (pre-installed on Windows 11 and recent Windows 10)
+- Windows 10/11 with WebView2 Runtime, or
+- Linux with GTK/WebKitGTK
 
-If WebView2 is not available, TITrack will show a message with a download
-link and automatically open in your default browser instead. Browser mode
-works identically to native window mode.
+If the native window backend is not available, TITrack will automatically
+open in your default browser instead. Browser mode works identically to
+native window mode.
 
 To install WebView2 Runtime manually:
    https://developer.microsoft.com/en-us/microsoft-edge/webview2/
@@ -33,6 +37,8 @@ You can also force browser mode manually:
 1. Open Command Prompt in the TITrack folder
 2. Run: TITrack.exe serve --no-window
 3. Your default browser will open to the dashboard
+
+On Linux, run: ./TITrack serve --no-window
 
 Or create a shortcut:
 - Right-click TITrack.exe -> Create shortcut

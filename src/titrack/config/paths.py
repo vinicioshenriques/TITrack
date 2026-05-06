@@ -11,6 +11,16 @@ def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
+def is_windows() -> bool:
+    """Check if running on Windows."""
+    return sys.platform == "win32"
+
+
+def is_linux() -> bool:
+    """Check if running on Linux."""
+    return sys.platform.startswith("linux")
+
+
 _CLOUD_SYNC_MARKERS = (
     ("onedrive", "OneDrive"),
     ("dropbox", "Dropbox"),
@@ -47,10 +57,11 @@ def detect_install_path_issue() -> Optional[tuple[str, str]]:
                 return ("cloud", name)
 
     app_path_lower = str(Path(sys.executable).parent).lower()
-    for env_key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
-        protected = os.environ.get(env_key)
-        if protected and app_path_lower.startswith(protected.lower()):
-            return ("program_files", "Program Files")
+    if is_windows():
+        for env_key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            protected = os.environ.get(env_key)
+            if protected and app_path_lower.startswith(protected.lower()):
+                return ("program_files", "Program Files")
 
     return None
 
@@ -80,6 +91,27 @@ def get_install_path_warning() -> Optional[str]:
             "Reinstall to a location like C:\\TITrack or %LOCALAPPDATA%\\TITrack."
         )
     return None
+
+
+def get_user_data_dir(app_name: str = "TITrack") -> Path:
+    """
+    Get the per-user data directory for the current platform.
+
+    Windows uses LOCALAPPDATA; Linux follows XDG_DATA_HOME with a
+    ~/.local/share fallback.
+    """
+    if is_windows():
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / app_name
+
+    if is_linux():
+        xdg_data_home = os.environ.get("XDG_DATA_HOME")
+        if xdg_data_home:
+            return Path(xdg_data_home) / app_name
+        return Path.home() / ".local" / "share" / app_name
+
+    return Path.home() / f".{app_name.lower()}"
 
 
 def get_app_dir() -> Path:
@@ -143,15 +175,8 @@ def get_data_dir(portable: bool = False) -> Path:
         # Portable mode or frozen: data beside exe
         data_dir = get_app_dir() / "data"
     else:
-        # Development: use user's local app data
-        import os
-
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            data_dir = Path(local_app_data) / "TITracker"
-        else:
-            # Fallback to beside app
-            data_dir = get_app_dir() / "data"
+        # Development: use the current platform's per-user app data directory.
+        data_dir = get_user_data_dir()
 
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir

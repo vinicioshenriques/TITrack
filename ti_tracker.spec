@@ -21,12 +21,14 @@ datas = [
     ('src/titrack/data/README.txt', '.'),
 ]
 
-# Check if overlay executable exists and add it
-overlay_exe = Path(SPECPATH) / 'overlay' / 'publish' / 'TITrackOverlay.exe'
-if overlay_exe.exists():
-    datas.append((str(overlay_exe), '.'))
-else:
-    print("Warning: TITrackOverlay.exe not found. Build it with: dotnet publish overlay/TITrackOverlay.csproj -c Release -o overlay/publish")
+# Check if Windows overlay executable exists and add it. Linux uses the bundled
+# HTML overlay through pywebview, so no WPF artifact is expected there.
+if sys.platform == 'win32':
+    overlay_exe = Path(SPECPATH) / 'overlay' / 'publish' / 'TITrackOverlay.exe'
+    if overlay_exe.exists():
+        datas.append((str(overlay_exe), '.'))
+    else:
+        print("Warning: TITrackOverlay.exe not found. Build it with: dotnet publish overlay/TITrackOverlay.csproj -c Release -o overlay/publish")
 
 # Hidden imports that PyInstaller might miss
 hiddenimports = [
@@ -56,10 +58,22 @@ hiddenimports = [
     # pywebview for native window
     'webview',
     'webview.platforms',
-    'webview.platforms.edgechromium',
-    'clr_loader',
-    'pythonnet',
 ]
+
+if sys.platform == 'win32':
+    hiddenimports.extend([
+        'webview.platforms.edgechromium',
+        'clr_loader',
+        'pythonnet',
+    ])
+elif sys.platform.startswith('linux'):
+    hiddenimports.extend([
+        'webview.platforms.gtk',
+        'gi',
+        'gi.repository.Gtk',
+        'gi.repository.Gdk',
+        'gi.repository.WebKit2',
+    ])
 
 # Exclude unnecessary modules to reduce size
 excludes = [

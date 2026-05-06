@@ -1,13 +1,78 @@
 """Configuration and settings management."""
 
-import os
+import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _steam_roots() -> list[Path]:
+    """Return common Steam roots on the current platform."""
+    roots = [
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".var/app/com.valvesoftware.Steam/data/Steam",
+    ]
+    return [root for root in roots if root.exists()]
+
+
+def _parse_steam_libraryfolders(vdf_path: Path) -> list[Path]:
+    """Parse Steam's libraryfolders.vdf enough to discover library paths."""
+    if not vdf_path.exists():
+        return []
+
+    try:
+        text = vdf_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    paths: list[Path] = []
+    for match in re.finditer(r'"path"\s+"([^"]+)"', text):
+        raw_path = match.group(1).replace("\\\\", "\\")
+        path = Path(raw_path).expanduser()
+        if path.exists():
+            paths.append(path)
+
+    return paths
+
+
+def _linux_game_paths() -> list[Path]:
+    """Return likely Torchlight Infinite install roots on Linux/Steam/Wine."""
+    steam_libraries: list[Path] = []
+    for root in _steam_roots():
+        steam_libraries.append(root)
+        steam_libraries.extend(
+            _parse_steam_libraryfolders(root / "steamapps" / "libraryfolders.vdf")
+        )
+
+    candidates: list[Path] = []
+    for library in steam_libraries:
+        candidates.append(library / "steamapps/common/Torchlight Infinite")
+
+    wine_prefixes = [
+        Path.home() / ".wine",
+        Path.home() / ".local/share/lutris/runners/wine",
+        Path.home() / ".local/share/lutris/prefixes/torchlight-infinite",
+        Path.home() / ".var/app/com.usebottles.bottles/data/bottles/bottles",
+    ]
+    for prefix in wine_prefixes:
+        candidates.extend(
+            [
+                prefix / "drive_c/Program Files/Torchlight Infinite",
+                prefix / "drive_c/Program Files (x86)/Torchlight Infinite",
+            ]
+        )
+
+    return candidates
+
+
 # Common game installation locations (Steam and standalone client)
-GAME_PATHS = [
+WINDOWS_GAME_PATHS = [
     # Steam library locations
     Path("C:/Program Files (x86)/Steam/steamapps/common/Torchlight Infinite"),
     Path("C:/Program Files/Steam/steamapps/common/Torchlight Infinite"),
@@ -26,6 +91,8 @@ GAME_PATHS = [
     Path("E:/Torchlight Infinite"),
 ]
 
+GAME_PATHS = WINDOWS_GAME_PATHS + (_linux_game_paths() if _is_linux() else [])
+
 # Keep for backwards compatibility
 STEAM_PATHS = GAME_PATHS
 
@@ -34,8 +101,11 @@ STEAM_PATHS = GAME_PATHS
 # Note: Windows is case-insensitive, but we include variations for clarity
 LOG_RELATIVE_PATHS = [
     Path("UE_Game/Torchlight/Saved/Logs/UE_game.log"),  # Steam (common)
+    Path("UE_Game/TorchLight/Saved/Logs/UE_game.log"),
+    Path("UE_game/Torchlight/Saved/Logs/UE_game.log"),
     Path("UE_game/TorchLight/Saved/Logs/UE_game.log"),  # Steam (alternate capitalization)
     Path("Game/UE_game/Torchlight/Saved/Logs/UE_game.log"),  # Standalone client
+    Path("Game/UE_game/TorchLight/Saved/Logs/UE_game.log"),
 ]
 
 # Keep for backwards compatibility
@@ -43,6 +113,46 @@ LOG_RELATIVE_PATH = LOG_RELATIVE_PATHS[0]
 
 # Log file name
 LOG_FILE_NAME = "UE_game.log"
+
+
+def _case_insensitive_child(parent: Path, name: str) -> Optional[Path]:
+    """Find a child by case-insensitive name on case-sensitive filesystems."""
+    try:
+        if not parent.exists() or not parent.is_dir():
+            return None
+        lowered = name.lower()
+        for child in parent.iterdir():
+            if child.name.lower() == lowered:
+                return child
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_case_insensitive(path: Path) -> Optional[Path]:
+    """Resolve a path even when path segment capitalization differs."""
+    if path.exists():
+        return path
+
+    if not _is_linux():
+        return None
+
+    parts = path.parts
+    if not parts:
+        return None
+
+    current = Path(parts[0])
+    for part in parts[1:]:
+        candidate = current / part
+        if candidate.exists():
+            current = candidate
+            continue
+        child = _case_insensitive_child(current, part)
+        if child is None:
+            return None
+        current = child
+
+    return current if current.exists() else None
 
 
 def resolve_log_path(user_path: str) -> Optional[Path]:
@@ -72,14 +182,14 @@ def resolve_log_path(user_path: str) -> Optional[Path]:
     # Case 2: User pointed to a directory - try to find the log file
     if path.is_dir():
         # Check if log file is directly in this directory (e.g., user pointed to Logs folder)
-        direct_log = path / LOG_FILE_NAME
-        if direct_log.exists():
+        direct_log = _resolve_case_insensitive(path / LOG_FILE_NAME)
+        if direct_log and direct_log.exists():
             return direct_log
 
         # Try appending known relative paths (user pointed to game root)
         for relative_path in LOG_RELATIVE_PATHS:
-            log_path = path / relative_path
-            if log_path.exists():
+            log_path = _resolve_case_insensitive(path / relative_path)
+            if log_path and log_path.exists():
                 return log_path
 
         # Try partial path matching - user might have pointed to an intermediate directory
@@ -92,8 +202,8 @@ def resolve_log_path(user_path: str) -> Optional[Path]:
                 if path.name.lower() == part.lower():
                     # User pointed to this directory, append the rest
                     remaining = Path(*parts[i + 1 :])
-                    log_path = path / remaining
-                    if log_path.exists():
+                    log_path = _resolve_case_insensitive(path / remaining)
+                    if log_path and log_path.exists():
                         return log_path
 
     return None
@@ -122,8 +232,8 @@ def find_log_file(custom_game_dir: Optional[str] = None) -> Optional[Path]:
     # Fall back to common game installation paths (try all relative paths for each)
     for game_path in GAME_PATHS:
         for relative_path in LOG_RELATIVE_PATHS:
-            log_path = game_path / relative_path
-            if log_path.exists():
+            log_path = _resolve_case_insensitive(game_path / relative_path)
+            if log_path and log_path.exists():
                 return log_path
     return None
 
@@ -145,9 +255,9 @@ def find_all_log_files() -> list[Path]:
     found: list[Path] = []
     for game_path in GAME_PATHS:
         for relative_path in LOG_RELATIVE_PATHS:
-            log_path = game_path / relative_path
+            log_path = _resolve_case_insensitive(game_path / relative_path)
             try:
-                if log_path.exists() and log_path.is_file():
+                if log_path and log_path.exists() and log_path.is_file():
                     resolved = log_path.resolve()
                     if resolved not in seen:
                         seen.add(resolved)
@@ -185,13 +295,12 @@ def get_default_db_path() -> Path:
     """
     Get the default database path.
 
-    Uses %LOCALAPPDATA%/TITrack/tracker.db on Windows.
+    Uses %LOCALAPPDATA%/TITrack/tracker.db on Windows and
+    $XDG_DATA_HOME/TITrack/tracker.db on Linux.
     """
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "TITrack" / "tracker.db"
-    # Fallback
-    return Path.home() / ".titrack" / "tracker.db"
+    from titrack.config.paths import get_user_data_dir
+
+    return get_user_data_dir() / "tracker.db"
 
 
 def get_portable_db_path() -> Path:
