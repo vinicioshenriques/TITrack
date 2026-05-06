@@ -133,7 +133,7 @@ class SyncManager:
             True if successfully enabled and connected, False otherwise
         """
         if not self.client.is_available:
-            self._last_error = "Supabase SDK not installed"
+            self._last_error = "Cloud sync is not configured"
             return False
 
         # Check if Supabase is configured
@@ -259,6 +259,10 @@ class SyncManager:
         )
         failed = failed_row[0] if failed_row else 0
 
+        last_error = self._last_error
+        if not self.client.is_available:
+            last_error = last_error or "Cloud sync is not configured"
+
         return SyncStatusInfo(
             status=self._status,
             enabled=self.is_enabled,
@@ -268,7 +272,7 @@ class SyncManager:
             queue_failed=failed,
             last_upload=self._last_upload,
             last_download=self._last_download,
-            last_error=self._last_error,
+            last_error=last_error,
             cloud_available=self.client.is_available,
         )
 
@@ -707,7 +711,7 @@ class SyncManager:
             return
 
         if not self.client.is_available:
-            print("Cloud sync: Supabase SDK not available")
+            print("Cloud sync: Not configured")
             return
 
         # Check config

@@ -1,21 +1,15 @@
-"""Supabase client wrapper for cloud sync."""
+"""Supabase REST client wrapper for cloud sync."""
 
 import json
 import logging
 import os
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger("titrack")
-
-# Supabase is optional - only required when cloud sync is enabled
-try:
-    from supabase import create_client, Client
-    SUPABASE_AVAILABLE = True
-except ImportError:
-    SUPABASE_AVAILABLE = False
-    Client = None
 
 
 @dataclass
@@ -56,77 +50,58 @@ class SubmitResult:
 
 class CloudClient:
     """
-    Supabase client wrapper for cloud price sync.
+    Supabase REST client for cloud price sync.
 
-    Handles connection, authentication, and all cloud API calls.
-    Uses anonymous device-based authentication (no user accounts).
+    The previous Python Supabase SDK pulls a large optional storage dependency
+    chain, which is brittle on newer Python versions. TITrack only needs
+    PostgREST table reads and two RPC calls, so urllib is enough.
     """
 
-    # Environment variable names
     ENV_SUPABASE_URL = "TITRACK_SUPABASE_URL"
     ENV_SUPABASE_KEY = "TITRACK_SUPABASE_KEY"
 
-    # Hardcoded defaults for packaged app (can be overridden by env vars)
-    # These will be populated when Supabase project is created
     DEFAULT_SUPABASE_URL = "https://qhjulyngunwiculnharg.supabase.co"
     DEFAULT_SUPABASE_KEY = "sb_publishable_YgqYSMUarrM_IKvcNpJlBw_KwTpp7ho"
 
     def __init__(self) -> None:
-        """Initialize the cloud client (not connected yet)."""
-        self._client: Optional[Client] = None
+        self._url: Optional[str] = None
+        self._key: Optional[str] = None
         self._connected = False
 
     @property
     def is_available(self) -> bool:
-        """Check if Supabase SDK is installed."""
-        return SUPABASE_AVAILABLE
+        """Check if cloud sync is configured."""
+        url, key = self.get_config()
+        return bool(url and key)
 
     @property
     def is_connected(self) -> bool:
-        """Check if currently connected to Supabase."""
-        return self._connected and self._client is not None
+        """Check if currently configured for requests."""
+        return self._connected and bool(self._url and self._key)
 
     def get_config(self) -> tuple[Optional[str], Optional[str]]:
-        """
-        Get Supabase configuration from environment or defaults.
-
-        Returns:
-            Tuple of (url, key) or (None, None) if not configured
-        """
+        """Get Supabase configuration from environment or defaults."""
         url = os.environ.get(self.ENV_SUPABASE_URL, self.DEFAULT_SUPABASE_URL)
         key = os.environ.get(self.ENV_SUPABASE_KEY, self.DEFAULT_SUPABASE_KEY)
-
         if not url or not key:
             return None, None
-
         return url, key
 
     def connect(self) -> bool:
-        """
-        Connect to Supabase.
-
-        Returns:
-            True if connection successful, False otherwise
-        """
-        if not SUPABASE_AVAILABLE:
-            return False
-
+        """Initialize REST client configuration."""
         url, key = self.get_config()
         if not url or not key:
             return False
 
-        try:
-            self._client = create_client(url, key)
-            self._connected = True
-            return True
-        except Exception as e:
-            print(f"Cloud sync: Failed to connect to Supabase: {e}")
-            self._connected = False
-            return False
+        self._url = url.rstrip("/")
+        self._key = key
+        self._connected = True
+        return True
 
     def disconnect(self) -> None:
         """Disconnect from Supabase."""
-        self._client = None
+        self._url = None
+        self._key = None
         self._connected = False
 
     def submit_price(
@@ -137,117 +112,68 @@ class CloudClient:
         price_fe: float,
         prices_array: list[float],
     ) -> SubmitResult:
-        """
-        Submit a price observation to the cloud.
-
-        Args:
-            device_id: This device's UUID
-            config_base_id: Item type ID
-            season_id: Current season/league ID
-            price_fe: Calculated reference price
-            prices_array: Full array of prices from AH search
-
-        Returns:
-            SubmitResult indicating success/failure
-        """
+        """Submit a price observation to the cloud."""
         if not self.is_connected:
             return SubmitResult(success=False, error="Not connected")
 
         try:
-            # Call the submit_price RPC function
-            result = self._client.rpc(
-                "submit_price",
-                {
+            result = self._request(
+                "POST",
+                "rpc/submit_price",
+                body={
                     "p_device_id": device_id,
                     "p_config_base_id": config_base_id,
                     "p_season_id": season_id,
                     "p_price_fe": price_fe,
                     "p_prices_array": prices_array,
                 },
-            ).execute()
+            )
 
-            # Check for rate limiting response
-            if result.data and isinstance(result.data, dict):
-                if result.data.get("rate_limited"):
-                    return SubmitResult(
-                        success=False,
-                        error="Rate limited",
-                        rate_limited=True,
-                    )
+            if isinstance(result, dict) and result.get("rate_limited"):
+                return SubmitResult(success=False, error="Rate limited", rate_limited=True)
+
+            if isinstance(result, dict) and result.get("success") is False:
+                return SubmitResult(success=False, error=result.get("error", "Submit failed"))
 
             return SubmitResult(success=True)
-
         except Exception as e:
             error_str = str(e)
             rate_limited = "rate" in error_str.lower() or "429" in error_str
-            return SubmitResult(
-                success=False,
-                error=error_str,
-                rate_limited=rate_limited,
-            )
+            return SubmitResult(success=False, error=error_str, rate_limited=rate_limited)
 
     def fetch_prices_delta(
         self, season_id: int, since: Optional[datetime] = None
     ) -> list[CloudPrice]:
-        """
-        Fetch aggregated prices that have changed since a timestamp.
-
-        Args:
-            season_id: Season to fetch prices for
-            since: Only fetch prices updated after this time (None = all)
-
-        Returns:
-            List of CloudPrice objects
-        """
+        """Fetch aggregated prices that have changed since a timestamp."""
         if not self.is_connected:
             return []
 
         try:
-            # Paginate to avoid Supabase's default 1000-row limit
-            PAGE_SIZE = 1000
-            all_rows = []
-            offset = 0
+            query: dict[str, str | int] = {
+                "select": "*",
+                "season_id": f"eq.{season_id}",
+            }
+            if since:
+                query["updated_at"] = f"gt.{since.isoformat()}"
 
-            while True:
-                query = (
-                    self._client.table("aggregated_prices")
-                    .select("*")
-                    .eq("season_id", season_id)
+            rows = self._fetch_rows("aggregated_prices", query)
+            return [
+                CloudPrice(
+                    config_base_id=row["config_base_id"],
+                    season_id=row["season_id"],
+                    price_fe_median=row["price_fe_median"],
+                    price_fe_p10=row.get("price_fe_p10"),
+                    price_fe_p90=row.get("price_fe_p90"),
+                    submission_count=row.get("submission_count"),
+                    unique_devices=row.get("unique_devices"),
+                    updated_at=(
+                        datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00"))
+                        if row.get("updated_at")
+                        else None
+                    ),
                 )
-
-                if since:
-                    query = query.gt("updated_at", since.isoformat())
-
-                result = query.range(offset, offset + PAGE_SIZE - 1).execute()
-
-                page = result.data or []
-                all_rows.extend(page)
-
-                if len(page) < PAGE_SIZE:
-                    break
-                offset += PAGE_SIZE
-
-            prices = []
-            for row in all_rows:
-                prices.append(
-                    CloudPrice(
-                        config_base_id=row["config_base_id"],
-                        season_id=row["season_id"],
-                        price_fe_median=row["price_fe_median"],
-                        price_fe_p10=row.get("price_fe_p10"),
-                        price_fe_p90=row.get("price_fe_p90"),
-                        submission_count=row.get("submission_count"),
-                        unique_devices=row.get("unique_devices"),
-                        updated_at=(
-                            datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00"))
-                            if row.get("updated_at")
-                            else None
-                        ),
-                    )
-                )
-
-            return prices
-
+                for row in rows
+            ]
         except Exception as e:
             print(f"Cloud sync: Failed to fetch prices: {e}")
             return []
@@ -258,99 +184,69 @@ class CloudClient:
         hours: int = 72,
         config_base_ids: list[int] | None = None,
     ) -> list[CloudPriceHistory]:
-        """
-        Fetch price history for sparklines.
-
-        Uses server-side RPC function when item IDs are provided (efficient),
-        falls back to paginated table query otherwise.
-
-        Args:
-            season_id: Season to fetch history for
-            hours: Number of hours of history to fetch
-            config_base_ids: Item IDs to fetch history for (uses RPC)
-
-        Returns:
-            List of CloudPriceHistory objects
-        """
+        """Fetch price history for sparklines."""
         if not self.is_connected:
             return []
 
-        # Use RPC when we have specific items (server-side filtering)
         if config_base_ids:
             try:
                 logger.info(f"Cloud sync: Fetching history via RPC for {len(config_base_ids)} items")
-                PAGE_SIZE = 1000
-                all_rows = []
-                offset = 0
-
-                while True:
-                    result = (
-                        self._client.rpc(
-                            "get_price_history_for_items",
-                            {
-                                "p_season_id": season_id,
-                                "p_config_base_ids": config_base_ids,
-                                "p_hours": hours,
-                            },
-                        )
-                        .range(offset, offset + PAGE_SIZE - 1)
-                        .execute()
-                    )
-
-                    page = result.data or []
-                    all_rows.extend(page)
-
-                    if len(page) < PAGE_SIZE:
-                        break
-                    offset += PAGE_SIZE
-
-                logger.info(f"Cloud sync: RPC returned {len(all_rows)} history rows")
-                if all_rows:
-                    return self._parse_history_rows(all_rows)
-                else:
-                    logger.info("Cloud sync: RPC returned empty, falling back to table query")
-                    # Fall through to paginated table query
-
+                rows = self._fetch_rpc_rows(
+                    "get_price_history_for_items",
+                    {
+                        "p_season_id": season_id,
+                        "p_config_base_ids": config_base_ids,
+                        "p_hours": hours,
+                    },
+                )
+                logger.info(f"Cloud sync: RPC returned {len(rows)} history rows")
+                if rows:
+                    return self._parse_history_rows(rows)
+                logger.info("Cloud sync: RPC returned empty, falling back to table query")
             except Exception as e:
                 logger.warning(f"Cloud sync: RPC fetch failed, falling back to table query: {e}")
-                # Fall through to paginated table query
 
-        # Fallback: paginated table query (for backwards compatibility or no item filter)
         try:
-            from datetime import timedelta
-
             cutoff = datetime.utcnow() - timedelta(hours=hours)
-
-            PAGE_SIZE = 1000
-            all_rows = []
-            offset = 0
-
-            while True:
-                result = (
-                    self._client.table("price_history")
-                    .select("*")
-                    .eq("season_id", season_id)
-                    .gt("hour_bucket", cutoff.isoformat())
-                    .order("hour_bucket", desc=False)
-                    .range(offset, offset + PAGE_SIZE - 1)
-                    .execute()
-                )
-
-                page = result.data or []
-                all_rows.extend(page)
-
-                if len(page) < PAGE_SIZE:
-                    break
-                offset += PAGE_SIZE
-
-            return self._parse_history_rows(all_rows)
-
+            rows = self._fetch_rows(
+                "price_history",
+                {
+                    "select": "*",
+                    "season_id": f"eq.{season_id}",
+                    "hour_bucket": f"gt.{cutoff.isoformat()}",
+                    "order": "hour_bucket.asc",
+                },
+            )
+            return self._parse_history_rows(rows)
         except Exception as e:
             print(f"Cloud sync: Failed to fetch price history: {e}")
             return []
 
+    def fetch_item_history(
+        self, config_base_id: int, season_id: int, hours: int = 72
+    ) -> list[CloudPriceHistory]:
+        """Fetch price history for a specific item."""
+        if not self.is_connected:
+            return []
+
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=hours)
+            rows = self._fetch_rows(
+                "price_history",
+                {
+                    "select": "*",
+                    "config_base_id": f"eq.{config_base_id}",
+                    "season_id": f"eq.{season_id}",
+                    "hour_bucket": f"gt.{cutoff.isoformat()}",
+                    "order": "hour_bucket.asc",
+                },
+            )
+            return self._parse_history_rows(rows)
+        except Exception as e:
+            print(f"Cloud sync: Failed to fetch item history: {e}")
+            return []
+
     def _parse_history_rows(self, rows: list[dict]) -> list[CloudPriceHistory]:
-        """Parse raw rows into CloudPriceHistory objects."""
         history = []
         for row in rows:
             history.append(
@@ -368,56 +264,91 @@ class CloudClient:
             )
         return history
 
-    def fetch_item_history(
-        self, config_base_id: int, season_id: int, hours: int = 72
-    ) -> list[CloudPriceHistory]:
-        """
-        Fetch price history for a specific item.
+    def _headers(self, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+        headers = {
+            "apikey": self._key or "",
+            "Authorization": f"Bearer {self._key or ''}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "TITrack-CloudSync",
+        }
+        if extra:
+            headers.update(extra)
+        return headers
 
-        Args:
-            config_base_id: Item to fetch history for
-            season_id: Season to fetch history for
-            hours: Number of hours of history to fetch
-
-        Returns:
-            List of CloudPriceHistory objects ordered by time
-        """
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[dict[str, str | int]] = None,
+        body: Optional[dict] = None,
+        headers: Optional[dict[str, str]] = None,
+        timeout: int = 30,
+    ) -> object:
         if not self.is_connected:
-            return []
+            raise RuntimeError("Not connected")
 
-        try:
-            # Calculate cutoff time
-            from datetime import timedelta
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
+        url = f"{self._url}/rest/v1/{path.lstrip('/')}"
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query)}"
 
-            result = (
-                self._client.table("price_history")
-                .select("*")
-                .eq("config_base_id", config_base_id)
-                .eq("season_id", season_id)
-                .gt("hour_bucket", cutoff.isoformat())
-                .order("hour_bucket", desc=False)
-                .execute()
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers=self._headers(headers),
+        )
+
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8"))
+
+    def _fetch_rows(
+        self,
+        path: str,
+        query: dict[str, str | int],
+        *,
+        page_size: int = 1000,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page_query = dict(query)
+            page_query["limit"] = page_size
+            page_query["offset"] = offset
+            page = self._request("GET", path, query=page_query)
+            if not isinstance(page, list):
+                break
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return rows
+
+    def _fetch_rpc_rows(
+        self,
+        function_name: str,
+        body: dict,
+        *,
+        page_size: int = 1000,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page = self._request(
+                "POST",
+                f"rpc/{function_name}",
+                body=body,
+                headers={"Range": f"{offset}-{offset + page_size - 1}"},
             )
-
-            history = []
-            for row in result.data or []:
-                history.append(
-                    CloudPriceHistory(
-                        config_base_id=row["config_base_id"],
-                        season_id=row["season_id"],
-                        hour_bucket=datetime.fromisoformat(
-                            row["hour_bucket"].replace("Z", "+00:00")
-                        ),
-                        price_fe_median=row["price_fe_median"],
-                        price_fe_p10=row.get("price_fe_p10"),
-                        price_fe_p90=row.get("price_fe_p90"),
-                        submission_count=row.get("submission_count"),
-                    )
-                )
-
-            return history
-
-        except Exception as e:
-            print(f"Cloud sync: Failed to fetch item history: {e}")
-            return []
+            if not isinstance(page, list):
+                break
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return rows

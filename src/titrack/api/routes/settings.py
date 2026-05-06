@@ -32,6 +32,7 @@ ALLOWED_SETTINGS = {
     "overlay_position",
     "overlay_size",
     "overlay_micro_position",
+    "overlay_pinned",
     "realtime_tracking_enabled",
     "hidden_items_exclude_worth",
     "window_position",

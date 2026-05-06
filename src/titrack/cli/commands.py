@@ -57,6 +57,19 @@ class OverlayState:
     window: Optional[object] = None
 
 
+def _initialize_service_db(settings: Settings) -> tuple[Database, Repository, SyncManager]:
+    """Create the background DB connection used by collector and cloud sync."""
+    db = Database(settings.db_path)
+    db.connect()
+    initialize_gear_allowlist(db)
+    initialize_supply_categories(db)
+
+    repo = Repository(db)
+    sync_manager = SyncManager(db)
+    sync_manager.initialize()
+    return db, repo, sync_manager
+
+
 def print_delta(delta: ItemDelta, repo: Repository) -> None:
     """Print a delta to console."""
     item_name = repo.get_item_name(delta.config_base_id)
@@ -532,6 +545,7 @@ def _serve_browser_mode(args: argparse.Namespace, settings: Settings, logger, sh
     collector = None
     collector_thread = None
     collector_db = None
+    collector_repo = None
     player_info = None
     sync_manager = None
     api_db = None
@@ -549,21 +563,11 @@ def _serve_browser_mode(args: argparse.Namespace, settings: Settings, logger, sh
             else:
                 logger.info("Waiting for character login...")
 
-            # Collector gets its own database connection
-            collector_db = Database(settings.db_path)
-            collector_db.connect()
-            initialize_gear_allowlist(collector_db)
-            initialize_supply_categories(collector_db)
-
-            collector_repo = Repository(collector_db)
+            # Collector and cloud sync share a background database connection.
+            collector_db, collector_repo, sync_manager = _initialize_service_db(settings)
 
             # Resolve player_id from saved mapping if missing from log
             player_info = _resolve_player_id(player_info, collector_repo, logger)
-
-            # Initialize sync manager (uses collector's DB connection)
-            # Don't set season context yet - wait for player detection from live log
-            sync_manager = SyncManager(collector_db)
-            sync_manager.initialize()
 
             # Set season context from pre-seeded player info so cloud sync
             # works even if the live log detects the same player (no callback fired)
@@ -608,6 +612,9 @@ def _serve_browser_mode(args: argparse.Namespace, settings: Settings, logger, sh
             logger.warning("No log file found - collector not started")
             if settings.log_path:
                 logger.warning(f"Expected: {settings.log_path}")
+            # Cloud sync does not require a live game log, so initialize it even
+            # when collector startup is waiting for the user to configure TI.
+            collector_db, collector_repo, sync_manager = _initialize_service_db(settings)
 
         # API gets its own database connection
         api_db = Database(settings.db_path)
@@ -943,12 +950,38 @@ def _configure_linux_webview_environment(logger) -> None:
         os.environ["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
         logger.info("Set WEBKIT_DISABLE_COMPOSITING_MODE=1 for Linux WebKitGTK stability")
 
+    # Arch/CachyOS Mesa stacks can route GTK/WebKit through Zink/Vulkan and
+    # fail during device selection ("ZINK: failed to choose pdev"). These
+    # process-local defaults keep TITrack on the conservative GTK/WebKit path.
+    linux_graphics_defaults = {
+        "WEBKIT_DISABLE_DMABUF_RENDERER": "1",
+        "GDK_DISABLE": "vulkan",
+        "GSK_RENDERER": "cairo",
+        "LIBGL_ALWAYS_SOFTWARE": "1",
+    }
+    for key, value in linux_graphics_defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            logger.info(f"Set {key}={value} for Linux WebKitGTK stability")
+
 
 def _webview_start_kwargs() -> dict:
     """Return backend kwargs for pywebview.start on the current platform."""
     if sys.platform == "win32":
         return {"gui": "edgechromium"}
     return {}
+
+
+def _force_process_exit_after_timeout(logger, seconds: float = 5.0) -> None:
+    """Force process exit if native GUI/server threads do not stop cleanly."""
+    def _watchdog():
+        import time
+
+        time.sleep(seconds)
+        logger.warning("Shutdown did not complete in time; forcing process exit")
+        os._exit(0)
+
+    threading.Thread(target=_watchdog, daemon=True, name="shutdown-watchdog").start()
 
 
 def _overlay_is_running(overlay_state: OverlayState) -> bool:
@@ -989,6 +1022,7 @@ def _launch_overlay_window(
     overlay_state: OverlayState,
     on_close=None,
     js_api=None,
+    repo: Optional[Repository] = None,
 ) -> bool:
     try:
         import webview
@@ -1002,34 +1036,75 @@ def _launch_overlay_window(
 
     overlay_url = f"{url}/overlay.html"
 
-    create_kwargs = {
+    base_kwargs = {
         "width": 320,
         "height": 500,
         "min_size": (180, 200),
         "resizable": True,
         "frameless": True,
         "on_top": True,
-        "background_color": "#1a1a2e" if _is_linux() else CHROMA_KEY_COLOR_HEX,
     }
 
-    if js_api is not None:
-        create_kwargs["js_api"] = js_api
+    if repo is not None:
+        try:
+            pos_str = repo.get_setting("overlay_position")
+            if pos_str:
+                x_str, y_str = pos_str.split(",", 1)
+                base_kwargs["x"] = int(float(x_str))
+                base_kwargs["y"] = int(float(y_str))
+        except Exception as e:
+            logger.debug(f"Could not load overlay position: {e}")
 
+    if js_api is not None:
+        base_kwargs["js_api"] = js_api
+
+    create_attempts: list[dict] = []
     if _is_linux():
+        linux_kwargs = dict(base_kwargs)
+        opaque_kwargs = dict(base_kwargs)
+        opaque_kwargs["background_color"] = "#1a1a2e"
+
         try:
             import inspect
-            if "transparent" in inspect.signature(webview.create_window).parameters:
-                create_kwargs["transparent"] = True
-            if "easy_drag" in inspect.signature(webview.create_window).parameters:
-                create_kwargs["easy_drag"] = True
+            params = inspect.signature(webview.create_window).parameters
+            if "easy_drag" in params:
+                linux_kwargs["easy_drag"] = True
+                opaque_kwargs["easy_drag"] = True
+            if "transparent" in params:
+                # Some GTK/WebKit builds support true transparent windows.
+                # pywebview expects #RRGGBB colors, so don't pass an alpha color.
+                transparent_kwargs = dict(linux_kwargs)
+                transparent_kwargs["transparent"] = True
+                create_attempts.append(transparent_kwargs)
         except Exception:
             pass
 
-    window = webview.create_window(
-        "TITrack Overlay",
-        overlay_url,
-        **create_kwargs,
-    )
+        create_attempts.append(opaque_kwargs)
+    else:
+        create_kwargs = dict(base_kwargs)
+        create_kwargs["background_color"] = CHROMA_KEY_COLOR_HEX
+        create_attempts.append(create_kwargs)
+
+    window = None
+    last_error = None
+    for index, create_kwargs in enumerate(create_attempts, start=1):
+        try:
+            window = webview.create_window(
+                "TITrack Overlay",
+                overlay_url,
+                **create_kwargs,
+            )
+            if index > 1:
+                logger.info("Overlay opened with fallback window options")
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Overlay window creation attempt {index} failed: {e}")
+
+    if window is None:
+        logger.error(f"Overlay window creation failed: {last_error}")
+        return False
+
     overlay_state.window = window
 
     def on_overlay_closing():
@@ -1083,6 +1158,7 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
     api_db = None
     server_thread = None
     shutdown_event = threading.Event()
+    shutdown_started = [False]
 
     def cleanup():
         """Clean up all resources."""
@@ -1122,18 +1198,10 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
             else:
                 logger.info("Waiting for character login...")
 
-            collector_db = Database(settings.db_path)
-            collector_db.connect()
-            initialize_gear_allowlist(collector_db)
-            initialize_supply_categories(collector_db)
-
-            collector_repo = Repository(collector_db)
+            collector_db, collector_repo, sync_manager = _initialize_service_db(settings)
 
             # Resolve player_id from saved mapping if missing from log
             player_info = _resolve_player_id(player_info, collector_repo, logger)
-
-            sync_manager = SyncManager(collector_db)
-            sync_manager.initialize()
 
             # Set season context from pre-seeded player info so cloud sync
             # works even if the live log detects the same player (no callback fired)
@@ -1176,6 +1244,8 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
             logger.warning("No log file found - collector not started")
             if settings.log_path:
                 logger.warning(f"Expected: {settings.log_path}")
+            # Cloud sync does not require a live game log.
+            collector_db, collector_repo, sync_manager = _initialize_service_db(settings)
 
         # API gets its own database connection
         api_db = Database(settings.db_path)
@@ -1251,10 +1321,15 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
 
         # Create and run the native window
         def on_closing():
+            if shutdown_started[0]:
+                return
+            shutdown_started[0] = True
             logger.info("Window closed, initiating shutdown...")
+            _force_process_exit_after_timeout(logger)
             save_window_state()
             _close_overlay(overlay_state, logger)
             server.should_exit = True
+            server.force_exit = True
             cleanup()
 
         # JavaScript API for native dialogs
@@ -1308,7 +1383,13 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                             return True
                         return False
 
-                    return _launch_overlay_window(url, logger, self._overlay_state, js_api=self)
+                    return _launch_overlay_window(
+                        url,
+                        logger,
+                        self._overlay_state,
+                        js_api=self,
+                        repo=Repository(api_db),
+                    )
                 except Exception as e:
                     logger.error(f"Error launching overlay: {e}")
                     return False
@@ -1333,6 +1414,66 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                     return True
                 except Exception as e:
                     logger.error(f"Error toggling overlay transparency: {e}")
+                    return False
+
+            def overlay_drag_start(self, screen_x: int, screen_y: int) -> bool:
+                """Start dragging the HTML overlay window."""
+                try:
+                    w = self._overlay_state.window
+                    if w is None:
+                        return False
+                    self._drag_start_screen = (int(screen_x), int(screen_y))
+                    self._drag_start_window = (int(getattr(w, "x", 0)), int(getattr(w, "y", 0)))
+                    return True
+                except Exception as e:
+                    logger.error(f"Overlay drag start error: {e}")
+                    return False
+
+            def overlay_drag_move(self, screen_x: int, screen_y: int) -> bool:
+                """Move overlay according to pointer movement."""
+                try:
+                    w = self._overlay_state.window
+                    if w is None:
+                        return False
+                    start_screen = getattr(self, "_drag_start_screen", None)
+                    start_window = getattr(self, "_drag_start_window", None)
+                    if not start_screen or not start_window:
+                        return False
+                    dx = int(screen_x) - start_screen[0]
+                    dy = int(screen_y) - start_screen[1]
+                    new_x = start_window[0] + dx
+                    new_y = start_window[1] + dy
+                    w.move(new_x, new_y)
+                    return True
+                except Exception as e:
+                    logger.error(f"Overlay drag move error: {e}")
+                    return False
+
+            def overlay_drag_end(self) -> bool:
+                """Persist overlay position after dragging."""
+                try:
+                    w = self._overlay_state.window
+                    if w is None:
+                        return False
+                    Repository(api_db).set_setting("overlay_position", f"{int(w.x)},{int(w.y)}")
+                    self._drag_start_screen = None
+                    self._drag_start_window = None
+                    return True
+                except Exception as e:
+                    logger.error(f"Overlay drag end error: {e}")
+                    return False
+
+            def reset_overlay_position(self) -> bool:
+                """Move overlay back near the top-left corner and persist it."""
+                try:
+                    w = self._overlay_state.window
+                    if w is None:
+                        return False
+                    w.move(80, 80)
+                    Repository(api_db).set_setting("overlay_position", "80,80")
+                    return True
+                except Exception as e:
+                    logger.error(f"Overlay reset position error: {e}")
                     return False
 
         # Use lists to allow the API to reference windows after creation
@@ -1485,7 +1626,13 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                 if sys.platform == "win32":
                     overlay_state.process = _launch_overlay_process(url, logger)
                 else:
-                    _launch_overlay_window(url, logger, overlay_state, js_api=api)
+                    _launch_overlay_window(
+                        url,
+                        logger,
+                        overlay_state,
+                        js_api=api,
+                        repo=Repository(api_db),
+                    )
 
             # If overlay-only mode, wait for overlay to exit instead of starting pywebview main window
             if overlay_only:
@@ -1516,6 +1663,10 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                 webview.start(**_webview_start_kwargs())
 
             logger.info("Application shutdown complete")
+            if server_thread and server_thread.is_alive():
+                server.should_exit = True
+                server.force_exit = True
+                server_thread.join(timeout=2.0)
             return 0
         except Exception as webview_error:
             # pywebview failed - fall back to browser mode. Browser mode works
@@ -1553,7 +1704,10 @@ def _serve_with_window(args: argparse.Namespace, settings: Settings, logger, sho
                 pass
 
             server.should_exit = True
+            server.force_exit = True
             cleanup()
+            if server_thread and server_thread.is_alive():
+                server_thread.join(timeout=2.0)
             return 0
 
     except Exception as e:

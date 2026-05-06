@@ -33,8 +33,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Cloud sync support (optional - install with: pip install titrack[cloud])
-cloud = ["supabase>=2.0.0"]
+# Kept for compatibility with older install docs. Cloud sync now uses the
+# standard library HTTP client, so this extra intentionally installs nothing.
+cloud = []
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

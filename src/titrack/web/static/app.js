@@ -1379,7 +1379,8 @@ function renderCloudStatus(status) {
         return;
     }
 
-    // Enable toggle if cloud is available
+    // Enable toggle if the cloud client dependency is available. A character
+    // does not need to be detected just to turn sync on.
     toggle.disabled = !status.cloud_available;
     toggle.checked = status.enabled;
     cloudSyncEnabled = status.enabled;
@@ -1399,12 +1400,20 @@ function renderCloudStatus(status) {
         indicator.classList.add('offline');
         indicator.title = 'Cloud sync offline';
     } else {
-        indicator.title = 'Cloud sync disabled';
+        indicator.title = status.cloud_available
+            ? 'Cloud sync disabled'
+            : (status.last_error || 'Cloud sync unavailable');
     }
 
     // Add queue info to title
     if (status.queue_pending > 0) {
         indicator.title += ` (${status.queue_pending} pending)`;
+    }
+
+    if (toggle.disabled) {
+        toggle.title = indicator.title;
+    } else {
+        toggle.title = '';
     }
 }
 

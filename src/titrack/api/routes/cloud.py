@@ -116,6 +116,7 @@ def get_cloud_status(
             download_enabled=True,
             queue_pending=0,
             queue_failed=0,
+            last_error="Cloud sync manager not initialized",
             cloud_available=False,
         )
 

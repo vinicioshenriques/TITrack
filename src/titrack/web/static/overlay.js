@@ -5,6 +5,10 @@ const REFRESH_INTERVAL = 2000; // 2 seconds for responsive updates
 
 let refreshTimer = null;
 let isTransparent = false;
+let isPinned = false;
+let isDragging = false;
+let dragMoveQueued = false;
+let latestDragEvent = null;
 const failedIcons = new Set();
 
 // --- API Calls ---
@@ -54,6 +58,29 @@ async function saveTransparencySetting(enabled) {
         });
     } catch (error) {
         console.error('Error saving transparency setting:', error);
+    }
+}
+
+async function fetchPinnedSetting() {
+    try {
+        const response = await fetch(`${API_BASE}/settings/overlay_pinned`);
+        if (!response.ok) return false;
+        const data = await response.json();
+        return data.value === 'true';
+    } catch (error) {
+        return false;
+    }
+}
+
+async function savePinnedSetting(enabled) {
+    try {
+        await fetch(`${API_BASE}/settings/overlay_pinned`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: enabled ? 'true' : 'false' })
+        });
+    } catch (error) {
+        console.error('Error saving overlay pin setting:', error);
     }
 }
 
@@ -227,6 +254,110 @@ async function applyTransparency(enabled) {
     }
 }
 
+// --- Pin / Move Overlay ---
+
+async function togglePin() {
+    isPinned = !isPinned;
+    applyPinState();
+    await savePinnedSetting(isPinned);
+}
+
+function applyPinState() {
+    document.body.classList.toggle('pinned', isPinned);
+    const icon = document.getElementById('pin-icon');
+    const button = document.querySelector('.pin-btn');
+    if (icon) icon.textContent = isPinned ? 'L' : 'P';
+    if (button) {
+        button.title = isPinned ? 'Unlock overlay position' : 'Lock overlay position';
+    }
+}
+
+function hasOverlayMoveApi() {
+    return window.pywebview
+        && window.pywebview.api
+        && window.pywebview.api.overlay_drag_start
+        && window.pywebview.api.overlay_drag_move
+        && window.pywebview.api.overlay_drag_end;
+}
+
+function initOverlayDrag() {
+    const header = document.querySelector('.overlay-header');
+    if (!header) return;
+
+    header.addEventListener('pointerdown', async (event) => {
+        if (event.button !== 0 || isPinned || event.target.closest('button')) {
+            return;
+        }
+        if (!hasOverlayMoveApi()) {
+            return;
+        }
+        event.preventDefault();
+        header.setPointerCapture(event.pointerId);
+        isDragging = true;
+        try {
+            await window.pywebview.api.overlay_drag_start(event.screenX, event.screenY);
+        } catch (error) {
+            console.error('Overlay drag start failed:', error);
+            isDragging = false;
+        }
+    });
+
+    header.addEventListener('pointermove', (event) => {
+        if (!isDragging || isPinned || !hasOverlayMoveApi()) {
+            return;
+        }
+        latestDragEvent = event;
+        if (dragMoveQueued) {
+            return;
+        }
+        dragMoveQueued = true;
+        requestAnimationFrame(() => {
+            dragMoveQueued = false;
+            if (!latestDragEvent || !isDragging) {
+                return;
+            }
+            window.pywebview.api.overlay_drag_move(
+                latestDragEvent.screenX,
+                latestDragEvent.screenY
+            ).catch(error => console.error('Overlay drag move failed:', error));
+        });
+    });
+
+    const endDrag = async (event) => {
+        if (!isDragging) return;
+        isDragging = false;
+        latestDragEvent = null;
+        try {
+            if (header.hasPointerCapture(event.pointerId)) {
+                header.releasePointerCapture(event.pointerId);
+            }
+        } catch (error) {
+            // Ignore pointer capture cleanup races.
+        }
+        if (hasOverlayMoveApi()) {
+            try {
+                await window.pywebview.api.overlay_drag_end();
+            } catch (error) {
+                console.error('Overlay drag end failed:', error);
+            }
+        }
+    };
+
+    header.addEventListener('pointerup', endDrag);
+    header.addEventListener('pointercancel', endDrag);
+
+    header.addEventListener('dblclick', async (event) => {
+        if (event.target.closest('button') || !window.pywebview?.api?.reset_overlay_position) {
+            return;
+        }
+        try {
+            await window.pywebview.api.reset_overlay_position();
+        } catch (error) {
+            console.error('Overlay reset position failed:', error);
+        }
+    });
+}
+
 // --- Close Overlay ---
 
 function closeOverlay() {
@@ -296,6 +427,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             await applyTransparency(isTransparent);
         }, 100);
     }
+
+    isPinned = await fetchPinnedSetting();
+    applyPinState();
+    initOverlayDrag();
 
     // Initial data load
     await refreshAll();
